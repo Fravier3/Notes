@@ -1,0 +1,1 @@
+Lee primero ESTADO.md. Responde en español. Actualiza ESTADO.md con cambios y pruebas al cerrar. Para cambios web sigue https://github.com/GoogleChrome/modern-web-guidance. Mantén encabezados sólidos y área segura para iPad y iPhone. No incluyas credenciales privadas en el repositorio.

@@ -1,0 +1,831 @@
+// Library: Notability-style sidebar (notes, folders, recently deleted) and a
+// home screen with quick actions, templates and recent notes.
+import { h, uid, timeAgo, toast, pickFile, loadScript } from './util.js';
+import { icons } from './icons.js';
+import { db } from './db.js';
+import { settings, saveSettings, applyTheme } from './settings.js';
+import {
+  createNote, trashNote, restoreNote, deleteForever, purgeTrash, duplicateNote, exportNoteFile, exportBackup,
+  importFile, pdfToPages, imagesToPages, exportNotePDF, touchMeta, saveSubject, deleteSubject, newPage, defaultTitle,
+} from './notes.js';
+import { menu, popover, promptDialog, confirmDialog, progressDialog, closePopover, sheet } from './ui.js';
+import { SIZES } from './templates.js';
+import { templateGallery, templateCard } from './gallery.js';
+import { saveToDrive, backupToDrive, restoreFromDrive, driveInfo } from './drive.js';
+import { account, onStatus, signIn, signUp, signOut, updateName, syncNow, getStatus, signInGoogle, serverConfig } from './sync.js';
+
+const NOTE_TABS = ['all', 'recent', 'fav', 'unfiled'];
+// "13 Oct, 2026"
+const fmtDay = (t) => { const d = new Date(t); return `${d.getDate()} ${d.toLocaleDateString('en-GB', { month: 'short' }).slice(0, 3)}, ${d.getFullYear()}`; };
+const FOLDER_COLORS = ['#e5484d', '#f76b15', '#f5b400', '#30a46c', '#0090ff', '#6e56cf', '#d6409f', '#7c8088'];
+const REPO = 'https://github.com/ahilgalib/inknote';
+export const APP_VERSION = '2026.10.11 (9)';
+
+export class Library {
+  constructor({ openNote }) {
+    this.openNote = openNote;
+    this.view = localStorage.getItem('inknote.view') || 'home';
+    this.query = '';
+    this.selecting = false;
+    this.picked = new Set();
+    this.el = h('div', { class: 'library' });
+    this.onRemote = () => this.refresh();
+    this.onAcct = () => this.render();
+    window.addEventListener('inknote-remote-change', this.onRemote);
+    window.addEventListener('inknote-account', this.onAcct);
+  }
+
+  async mount(parent) {
+    parent.append(this.el);
+    purgeTrash().catch(() => {});
+    await this.refresh();
+    this.unsub = onStatus(() => this.renderSync());
+  }
+
+  destroy() {
+    window.removeEventListener('inknote-remote-change', this.onRemote);
+    window.removeEventListener('inknote-account', this.onAcct);
+    this.unsub && this.unsub();
+    this.el.remove();
+  }
+
+  async refresh() {
+    const all = await db.all('notes');
+    this.notes = all.filter((n) => !n.trashed);
+    this.trash = all.filter((n) => n.trashed);
+    this.folders = (await db.all('subjects')).sort((a, b) => (a.order || 0) - (b.order || 0));
+    if (this.view.startsWith('folder:') && !this.folders.find((f) => 'folder:' + f.id === this.view)) this.view = 'home';
+    this.render();
+  }
+
+  go(view) {
+    this.view = view;
+    this.query = '';
+    this.selecting = false;
+    this.picked = new Set();
+    try { localStorage.setItem('inknote.view', view); } catch {}
+    this.el.classList.remove('side-open');
+    this.render();
+  }
+
+  render() {
+    const E = this.el;
+    E.innerHTML = '';
+    E.append(this.renderSide(), this.renderMain());
+    this.renderSync();
+  }
+
+  // ---------------------------------------------------------------- sidebar --
+
+  renderSide() {
+    const search = h('input', { class: 'search', type: 'search', placeholder: 'Buscar', value: this.query, 'aria-label': 'Buscar notas' });
+    search.addEventListener('input', () => {
+      this.query = search.value;
+      if (this.query && !NOTE_TABS.includes(this.view) && !this.view.startsWith('folder:')) { this.view = 'all'; this.renderMainOnly(); search.focus(); }
+      else this.renderGrid();
+    });
+    const nav = (icon, label, on, onClick, count) => h('button', { class: 'nav-item' + (on ? ' on' : ''), onClick },
+      h('span', { class: 'nav-ico', html: icons[icon] }), h('span', { class: 'label' }, label), count != null ? h('span', { class: 'count' }, String(count)) : null);
+    const folderRows = this.folders.map((f) => h('button', {
+      class: 'nav-item folder' + (this.view === 'folder:' + f.id ? ' on' : ''), onClick: () => this.go('folder:' + f.id), 'data-folder': f.id,
+      onContextmenu: (e) => { e.preventDefault(); this.folderMenu(e.currentTarget, f); },
+    }, h('span', { class: 'fdot', style: { background: f.color } }), h('span', { class: 'label' }, f.name),
+    h('span', { class: 'side-more', html: icons.more, onClick: (e) => { e.stopPropagation(); this.folderMenu(e.currentTarget, f); } })));
+
+    this.syncCard = h('div', { class: 'sync-card' });
+    return h('nav', { class: 'lib-side' },
+      h('div', { class: 'side-top' },
+        h('button', { class: 'icon-btn gear', title: 'Ajustes', 'aria-label': 'Ajustes', html: icons.nGear, onClick: () => this.settingsSheet() })),
+      h('label', { class: 'side-search' }, h('span', { html: icons.search }), search),
+      h('div', { class: 'side-scroll' },
+        h('div', { class: 'nav' },
+          nav('nHome', 'Home', this.view === 'home', () => this.go('home')),
+          nav('nNotes', 'Notes', NOTE_TABS.includes(this.view), () => this.go('all'), this.notes.length),
+          nav('nGallery', 'Gallery', false, () => this.fromTemplate())),
+        h('div', { class: 'side-h' }, h('span', {}, 'Folders'),
+          h('button', { class: 'icon-btn sm', title: 'Nueva carpeta', 'aria-label': 'Nueva carpeta', html: icons.plus, onClick: () => this.newFolder() })),
+        folderRows.length ? folderRows : h('button', { class: 'folder-empty', onClick: () => this.newFolder() }, 'Organize notes into folders.'),
+        h('div', { class: 'nav bottom' },
+          nav('trash', 'Eliminadas', this.view === 'trash', () => this.go('trash'), this.trash.length || null))),
+      this.syncCard);
+  }
+
+  renderSync() {
+    const C = this.syncCard;
+    if (!C) return;
+    const st = getStatus();
+    const a = account();
+    C.innerHTML = '';
+    if (!a) {
+      C.append(h('b', {}, 'Sync across devices'),
+        h('p', {}, 'Your notes are saved on this device. Sign in to back them up and sync with your iPad, phone and computer.'),
+        h('button', { class: 'btn primary block', onClick: () => this.settingsSheet('account') }, 'Sign in / Create account'));
+      return;
+    }
+    const label = { syncing: 'Syncing…', synced: 'Synced · ' + timeAgo(st.last || Date.now()), offline: 'Offline — saved on this device', error: 'Sync paused — will retry', idle: 'Waiting to sync' }[st.state] || 'Synced';
+    C.append(h('div', { class: 'row' },
+      h('span', { class: 'sync-ico ' + st.state, html: st.state === 'offline' || st.state === 'error' ? icons.cloudOff : icons.cloud }),
+      h('div', { class: 'grow sync-text' }, h('b', {}, a.user.name || a.user.email), h('small', {}, label)),
+      h('button', { class: 'icon-btn sm', title: 'Sincronizar ahora', 'aria-label': 'Sincronizar ahora', html: icons.sync, onClick: () => syncNow() })));
+  }
+
+  // ------------------------------------------------------------------ main --
+
+  renderMainOnly() {
+    const old = this.el.querySelector('.lib-main');
+    const n = this.renderMain();
+    if (old) old.replaceWith(n); else this.el.append(n);
+  }
+
+  renderMain() {
+    const menuBtn = h('button', { class: 'icon-btn phone-only', 'aria-label': 'Menu', html: icons.menu, onClick: () => this.el.classList.toggle('side-open') });
+    const main = h('main', { class: 'lib-main' });
+    main.addEventListener('dragover', (e) => e.preventDefault());
+    main.addEventListener('drop', (e) => { e.preventDefault(); this.importFiles([...e.dataTransfer.files]); });
+    main.append(h('div', { class: 'side-scrim', onClick: () => this.el.classList.remove('side-open') }));
+    if (this.view === 'home') {
+      const home = this.renderHome();
+      main.append(this.topBar(menuBtn), h('div', { class: 'lib-title' }, h('h1', {}, this.homeTitle)), home);
+      return main;
+    }
+
+    const folder = this.view.startsWith('folder:') ? this.folders.find((f) => 'folder:' + f.id === this.view) : null;
+    const tabs = NOTE_TABS.includes(this.view);
+    const title = this.view === 'trash' ? 'Eliminadas' : folder ? folder.name : 'Todas las notas';
+    main.append(this.topBar(menuBtn, this.view === 'trash'
+      ? (this.trash.length ? h('button', { class: 'btn', onClick: () => this.emptyTrash() }, 'Empty') : null)
+      : this.selecting ? h('button', { class: 'btn primary', onClick: () => { this.selecting = false; this.picked.clear(); this.renderMainOnly(); } }, 'Done') : null),
+    h('div', { class: 'lib-title' },
+      folder ? h('button', { class: 'crumb', 'data-drop-out': '1', onClick: () => this.go('all') }, h('span', { html: icons.nLeft }), 'Todas las notas') : null,
+      h('h1', {}, folder ? h('span', { class: 'fdot big', style: { background: folder.color } }) : null, title,
+        folder ? h('button', { class: 'icon-btn title-more', 'aria-label': 'Folder options', html: icons.more, onClick: (e) => this.folderMenu(e.currentTarget, folder) }) : null),
+      tabs ? h('div', { class: 'tabs', role: 'tablist' }, [['all', 'Todas las notas'], ['recent', 'Recents'], ['fav', 'Favorites'], ['unfiled', 'Unfiled']].map(([v, l]) =>
+        h('button', { class: 'tab' + (this.view === v ? ' on' : ''), role: 'tab', onClick: () => this.go(v) }, l))) : null));
+    if (this.view === 'trash') main.append(h('p', { class: 'muted pad-x' }, 'Notes stay here for 30 days, then they are deleted for good.'));
+    this.grid = h('div', { class: 'grid' + (settings.libView === 'list' ? ' list' : '') + (this.selecting ? ' selecting' : '') });
+    main.append(h('div', { class: 'grid-wrap' }, this.grid));
+    if (this.selecting) {
+      this.pickBar = h('div', { class: 'pick-bar' });
+      main.append(this.pickBar);
+      this.renderPickBar();
+    }
+    this.renderGrid();
+    return main;
+  }
+
+  // bell · more · + New, top right (like Notability)
+  topBar(menuBtn, extra) {
+    return h('header', { class: 'lib-top' }, menuBtn, h('div', { class: 'grow' }), extra,
+      h('button', { class: 'icon-btn top-ico', title: 'Sincronización y cuenta', 'aria-label': 'Sincronización y cuenta', html: icons.nBell, onClick: (e) => this.statusPop(e.currentTarget) }),
+      h('button', { class: 'icon-btn top-ico', title: 'More', 'aria-label': 'More', html: icons.nMore, onClick: (e) => this.viewMenu(e.currentTarget) }),
+      h('button', { class: 'new-btn', onClick: (e) => this.newMenu(e.currentTarget) }, h('span', { html: icons.plus }), 'New'));
+  }
+
+  statusPop(anchor) {
+    const C = h('div', { class: 'sync-card pop' });
+    const keep = this.syncCard;
+    this.syncCard = C; this.renderSync(); this.syncCard = keep;
+    popover(anchor, C, { className: 'wide' });
+  }
+
+  viewMenu(anchor) {
+    const list = settings.libView === 'list';
+    menu(anchor, [
+      this.view === 'trash' || this.view === 'home' ? null : { label: 'Select notes', icon: 'check2', onClick: () => { this.selecting = true; this.picked.clear(); this.renderMainOnly(); } },
+      { label: list ? 'Grid view' : 'List view', icon: list ? 'grid' : 'list', onClick: () => { settings.libView = list ? 'grid' : 'list'; saveSettings(); this.renderMainOnly(); } },
+      { label: 'Sort…', icon: 'menu', onClick: () => this.sortMenu(anchor) },
+      '-',
+      { label: 'Import…', icon: 'download', onClick: () => this.importMenu(anchor) },
+      { label: 'Back up to Google Drive', icon: 'nDrive', onClick: () => backupToDrive() },
+      { label: 'Restore from Google Drive…', icon: 'restore', onClick: () => restoreFromDrive(anchor, () => this.refresh()) },
+      { label: 'Ajustes', icon: 'settings', onClick: () => this.settingsSheet() },
+    ]);
+  }
+
+  renderHome() {
+    const hour = new Date().getHours();
+    const hello = hour < 5 ? 'Good night' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+    const quick = (icon, label, onClick, cls = '') => h('button', { class: 'quick ' + cls, onClick }, h('span', { class: 'quick-ico', html: icons[icon] }), h('span', {}, label));
+    const tplRow = h('div', { class: 'tpl-row' });
+    const recent = [...this.notes].sort((a, b) => (b.opened || b.updated) - (a.opened || a.updated)).slice(0, 8);
+    const home = h('div', { class: 'home' },
+      h('div', { class: 'quick-row' },
+        quick('plus', 'Nueva nota', () => this.create(), 'primary'),
+        quick('nQuick', 'Nota rápida', () => this.create({ kind: 'quick' })),
+        quick('upload', 'Import or scan', (e) => this.importMenu(e.currentTarget)),
+        quick('nMic', 'Record lecture', () => this.create({ record: true }))),
+      h('section', { class: 'home-sec' },
+        h('div', { class: 'sec-head' }, h('h2', {}, 'Recent'), h('div', { class: 'grow' }),
+          recent.length ? h('button', { class: 'link-btn', onClick: () => this.go('all') }, 'All notes ›') : null),
+        recent.length ? h('div', { class: 'grid' }, recent.map((n) => this.noteCard(n)))
+          : h('button', { class: 'home-empty', onClick: () => this.create() }, h('span', { html: icons.nPen }), h('b', {}, 'Your notes will appear here'), h('small', {}, 'Tap to start your first note'))),
+      h('section', { class: 'home-sec' },
+        h('div', { class: 'sec-head' }, h('h2', {}, 'Templates'), h('div', { class: 'grow' }),
+          h('button', { class: 'link-btn', onClick: () => this.fromTemplate() }, 'See all ›')),
+        tplRow));
+    this.homeTitle = hello;
+    // template previews render progressively so the home screen appears instantly
+    const ids = ['assignment', 'dailyGoals', 'plannerDark', 'flashcard', 'weekly', 'lecture', 'cornell'];
+    let i = 0;
+    const step = () => {
+      if (i >= ids.length || !tplRow.isConnected && i > 0) return;
+      const id = ids[i++];
+      tplRow.append(templateCard(id, () => this.fromTemplate(id), 200));
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+    return h('div', { class: 'grid-wrap' }, home);
+  }
+
+  visibleNotes() {
+    const q = this.query.trim().toLowerCase();
+    let list = this.view === 'trash' ? this.trash : this.notes;
+    if (this.view.startsWith('folder:')) list = list.filter((n) => 'folder:' + n.subjectId === this.view);
+    if (this.view === 'fav') list = list.filter((n) => n.starred);
+    // All Notes shows folders as stacks (like Procreate) and the loose notes next to them
+    if (this.view === 'unfiled' || this.showStacks()) list = list.filter((n) => !n.subjectId || !this.folders.some((f) => f.id === n.subjectId));
+    if (this.view === 'recent') list = [...list].filter((n) => n.opened).sort((a, b) => b.opened - a.opened).slice(0, 30);
+    if (q) list = list.filter((n) => (n.title + ' ' + (n.text || '')).toLowerCase().includes(q));
+    const sort = settings.sort;
+    if (this.view === 'recent') return list;
+    return [...list].sort((a, b) => this.view === 'trash' ? b.trashed - a.trashed : sort === 'title' ? a.title.localeCompare(b.title) : sort === 'created' ? b.created - a.created : b.updated - a.updated);
+  }
+
+  showStacks() { return this.view === 'all' && !this.query.trim() && settings.libView !== 'list'; }
+
+  renderGrid() {
+    const G = this.grid;
+    if (!G) return;
+    G.innerHTML = '';
+    const list = this.visibleNotes();
+    const stacks = this.showStacks() ? this.folders : [];
+    for (const f of stacks) G.append(this.stackCard(f));
+    if (!list.length && !stacks.length) {
+      G.append(h('div', { class: 'empty' },
+        h('div', { class: 'empty-art', html: this.view === 'trash' ? icons.trash : icons.pen }),
+        h('h2', {}, this.query ? 'No matching notes' : this.view === 'trash' ? 'Nothing here' : this.view === 'fav' ? 'No favorites yet' : 'No notes yet'),
+        h('p', { class: 'muted' }, this.query ? 'Try another word.' : this.view === 'trash' ? 'Deleted notes appear here for 30 days.' : 'Create a note, start from a template, or import a PDF.'),
+        this.query || this.view === 'trash' ? null : h('div', { class: 'row center' },
+          h('button', { class: 'btn primary', onClick: () => this.create() }, 'Nueva nota'),
+          h('button', { class: 'btn', onClick: () => this.fromTemplate() }, 'Templates'),
+          h('button', { class: 'btn', onClick: () => this.importPDF() }, 'Import PDF'))));
+      return;
+    }
+    for (const n of list) G.append(this.noteCard(n));
+  }
+
+  // A folder shown as a pile of its notes. Drop notes on it to move them in.
+  stackCard(f) {
+    const inside = this.notes.filter((n) => n.subjectId === f.id).sort((a, b) => b.updated - a.updated);
+    const layer = (n, i) => h('div', { class: 'stack-layer l' + i },
+      n.kind === 'quick' ? h('div', { class: 'thumb-text' }, (n.text || '').split('\n').slice(0, 8).join('\n'))
+        : n.thumb ? h('img', { src: n.thumb, alt: '', loading: 'lazy' }) : h('div', { class: 'thumb-blank' }));
+    const card = h('div', { class: 'card stack', 'data-folder': f.id },
+      h('button', { class: 'card-open', 'aria-label': 'Open folder ' + f.name, onClick: () => { if (!this.selecting) this.go('folder:' + f.id); } },
+        h('div', { class: 'thumb stack-thumb', style: '--fc:' + f.color },
+          inside.length ? inside.slice(0, 3).reverse().map((n, i, a) => layer(n, a.length - 1 - i))
+            : h('div', { class: 'stack-empty', html: icons.folder }))),
+      h('div', { class: 'card-meta' },
+        h('div', { class: 'card-text' },
+          h('div', { class: 'card-title' }, h('span', { class: 'fdot', style: { background: f.color } }), f.name),
+          h('div', { class: 'card-sub' }, inside.length === 1 ? '1 note' : `${inside.length} notes`)),
+        h('button', { class: 'icon-btn sm card-more', title: 'Folder options', 'aria-label': 'Folder options', html: icons.more, onClick: (e) => { e.stopPropagation(); this.folderMenu(e.currentTarget, f); } })));
+    card.addEventListener('contextmenu', (e) => { e.preventDefault(); this.folderMenu(card, f); });
+    return card;
+  }
+
+  // ---- hold to select, drag onto a folder (or another note) to file it ----
+
+  startSelect(id) {
+    const wasSelecting = this.selecting;
+    this.selecting = true;
+    this.picked.add(id);
+    if (navigator.vibrate) navigator.vibrate(12);
+    if (!this.grid || !this.grid.isConnected || this.view === 'home') { this.view = 'all'; this.renderMainOnly(); return; }
+    // update in place: the card under the finger must stay in the page,
+    // or the browser stops sending its touch moves (no drag)
+    const G = this.grid;
+    G.classList.add('selecting');
+    for (const c of G.querySelectorAll('.card[data-note]')) {
+      const open = c.querySelector('.card-open');
+      if (open && !open.querySelector('.pick-mark')) open.prepend(h('span', { class: 'pick-mark', html: icons.check }));
+      c.classList.toggle('picked', this.picked.has(c.dataset.note));
+    }
+    if (!wasSelecting || !this.pickBar || !this.pickBar.isConnected) {
+      this.pickBar = h('div', { class: 'pick-bar' });
+      this.el.querySelector('.lib-main').append(this.pickBar);
+    }
+    this.renderPickBar();
+  }
+
+  bindHold(card, n) {
+    let t = null, st = null;
+    const cancel = () => { clearTimeout(t); t = null; };
+    card.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || n.trashed) return;
+      st = { x: e.clientX, y: e.clientY, id: e.pointerId };
+      cancel();
+      t = setTimeout(() => {
+        t = 'fired';
+        // the tap that ends the hold must not toggle the (re-drawn) card again
+        this.eatClickUntil = performance.now() + 1500;
+        this.startSelect(n.id);
+        this.drag = { ids: [...this.picked], x0: st.x, y0: st.y, pid: st.id, on: false };
+      }, 420);
+    });
+    card.addEventListener('pointermove', (e) => { if (t && t !== 'fired' && st && Math.hypot(e.clientX - st.x, e.clientY - st.y) > 8) cancel(); });
+    card.addEventListener('pointerup', () => { if (t !== 'fired') cancel(); else t = null; });
+    card.addEventListener('pointercancel', () => { if (t !== 'fired') cancel(); });
+  }
+
+  // window-level drag (cards are re-created while selecting)
+  bindDrag() {
+    if (this.dragBound) return;
+    this.dragBound = true;
+    const target = (x, y) => {
+      if (this.ghost) this.ghost.hidden = true;
+      const el = document.elementFromPoint(x, y);
+      if (this.ghost) this.ghost.hidden = false;
+      if (!el) return null;
+      const f = el.closest('[data-folder]');
+      if (f) return { el: f, folder: f.dataset.folder };
+      const out = el.closest('[data-drop-out]');
+      if (out) return { el: out, folder: null };
+      const c = el.closest('[data-note]');
+      if (c && !this.drag.ids.includes(c.dataset.note)) return { el: c, note: c.dataset.note };
+      return null;
+    };
+    window.addEventListener('pointermove', (e) => {
+      const d = this.drag;
+      if (!d || e.pointerId !== d.pid) return;
+      if (!d.on && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 10) return;
+      if (!d.on) {
+        d.on = true;
+        const first = this.notes.find((n) => n.id === d.ids[0]);
+        this.ghost = h('div', { class: 'drag-ghost' }, h('span', {}, first ? first.title : 'Note'), d.ids.length > 1 ? h('b', {}, String(d.ids.length)) : null);
+        document.body.append(this.ghost);
+        document.body.classList.add('dragging-notes');
+      }
+      this.ghost.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
+      const tg = target(e.clientX, e.clientY);
+      if (d.hover && (!tg || d.hover !== tg.el)) d.hover.classList.remove('drop-on');
+      if (tg) tg.el.classList.add('drop-on');
+      d.hover = tg && tg.el;
+      d.tg = tg;
+    });
+    // keep the page from scrolling while a note is being dragged
+    window.addEventListener('touchmove', (e) => { if (this.drag) e.preventDefault(); }, { passive: false });
+    const end = async (e) => {
+      const d = this.drag;
+      if (!d || e.pointerId !== d.pid) return;
+      this.drag = null;
+      if (this.ghost) { this.ghost.remove(); this.ghost = null; }
+      document.body.classList.remove('dragging-notes');
+      if (d.hover) d.hover.classList.remove('drop-on');
+      if (!d.on || !d.tg || e.type === 'pointercancel') return;
+      if (d.tg.note) await this.stackWith(d.ids, d.tg.note);
+      else await this.moveNotes(d.ids, d.tg.folder);
+    };
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    window.addEventListener('click', (e) => {
+      if (this.eatClickUntil && performance.now() < this.eatClickUntil) { e.stopPropagation(); e.preventDefault(); }
+      this.eatClickUntil = 0;
+    }, true);
+  }
+
+  async moveNotes(ids, folderId) {
+    const list = this.notes.filter((n) => ids.includes(n.id));
+    for (const n of list) { n.subjectId = folderId || null; await touchMeta(n); }
+    const f = this.folders.find((x) => x.id === folderId);
+    toast(f ? `Moved ${list.length === 1 ? '1 note' : list.length + ' notes'} to ${f.name}` : 'Moved out of the folder');
+    this.selecting = false; this.picked.clear();
+    await this.refresh();
+  }
+
+  // drop a note on another note: both go into a new folder (like Procreate stacks)
+  async stackWith(ids, otherId) {
+    const f = await this.newFolder('Nueva carpeta', true);
+    if (!f) return;
+    await this.moveNotes([...ids, otherId], f.id);
+  }
+
+
+  renderPickBar() {
+    const B = this.pickBar;
+    if (!B) return;
+    B.innerHTML = '';
+    const ids = [...this.picked], list = this.notes.filter((n) => this.picked.has(n.id));
+    const act = (icon, label, fn, cls = '') => h('button', { class: 'pick-act ' + cls, disabled: !ids.length, onClick: fn }, h('span', { html: icons[icon] }), h('small', {}, label));
+    const done = () => { this.selecting = false; this.picked.clear(); this.refresh(); };
+    B.append(
+      h('button', { class: 'pick-x', title: 'Done', 'aria-label': 'Done', html: icons.close, onClick: done }),
+      h('b', { class: 'pick-count' }, ids.length ? `${ids.length} selected` : 'Tap notes to select'),
+      act('starOn', 'Favorite', async () => { const on = !list.every((n) => n.starred); for (const n of list) { if (on) n.starred = true; else delete n.starred; await touchMeta(n); } done(); }),
+      act('folder', 'Move', (e) => menu(e.currentTarget, [
+        { label: 'No folder', onClick: async () => { for (const n of list) { n.subjectId = null; await touchMeta(n); } done(); } },
+        ...this.folders.map((f) => ({ label: f.name, onClick: async () => { for (const n of list) { n.subjectId = f.id; await touchMeta(n); } done(); } })),
+      ])),
+      act('nStack', 'Nueva carpeta', async () => { const f = await this.newFolder('Nueva carpeta', true); if (f) await this.moveNotes(ids, f.id); }),
+      act('duplicate', 'Duplicate', async () => { for (const n of list) await duplicateNote(n); done(); }),
+      ids.length === 1 ? act('more', 'More', (e) => this.noteMenu(e.currentTarget, list[0])) : '',
+      act('trash', 'Delete', async () => {
+        for (const n of list) await trashNote(n);
+        toast(list.length === 1 ? 'Deleted · find it in Recently Deleted' : `Deleted ${list.length} notes · find them in Recently Deleted`, 3200);
+        done();
+      }, 'danger'),
+      h('button', { class: 'link-btn', onClick: () => { const all = this.visibleNotes(); if (this.picked.size === all.length) this.picked.clear(); else all.forEach((n) => this.picked.add(n.id)); this.renderGrid(); this.renderPickBar(); } }, 'All'));
+  }
+
+  noteCard(n) {
+    const folder = this.folders.find((s) => s.id === n.subjectId);
+    const trashed = !!n.trashed;
+    const open = () => {
+      if (this.selecting && !trashed) {
+        if (this.picked.has(n.id)) this.picked.delete(n.id); else this.picked.add(n.id);
+        card.classList.toggle('picked', this.picked.has(n.id));
+        this.renderPickBar();
+        return;
+      }
+      trashed ? this.trashMenu(card, n) : this.openNote(n.id);
+    };
+    const card = h('div', { class: 'card' + (this.picked.has(n.id) ? ' picked' : ''), 'data-note': n.id },
+      h('button', { class: 'card-open', onClick: open, 'aria-label': 'Open ' + n.title },
+        this.selecting ? h('span', { class: 'pick-mark', html: icons.check }) : null,
+        n.kind === 'quick'
+          ? h('div', { class: 'thumb thumb-text' }, (n.text || '').split('\n').slice(0, 12).map((l) => h('div', { class: /^\s*☑ /.test(l) ? 'done' : '' }, l || '\u00a0')))
+          : h('div', { class: 'thumb' }, n.thumb ? h('img', { src: n.thumb, alt: '', loading: 'lazy' }) : h('div', { class: 'thumb-blank' }))),
+      h('div', { class: 'card-meta' },
+        h('div', { class: 'card-text' },
+          h('div', { class: 'card-title' }, n.starred ? h('span', { class: 'star', html: icons.starOn }) : null, n.locked ? h('span', { class: 'star', html: icons.lock }) : null, n.title),
+          h('div', { class: 'card-sub' }, trashed ? `Deleted ${timeAgo(n.trashed)}` : fmtDay(n.updated))),
+        folder ? h('span', { class: 'fchip', style: '--fc:' + folder.color }, folder.name) : null,
+        h('button', { class: 'icon-btn sm card-more', title: 'Note options', 'aria-label': 'Note options', html: icons.more, onClick: (e) => { e.stopPropagation(); trashed ? this.trashMenu(e.currentTarget, n) : this.noteMenu(e.currentTarget, n); } })));
+    // hold: select (then tap more notes, or drag them onto a folder) — like Google Keep
+    this.bindHold(card, n);
+    this.bindDrag();
+    card.addEventListener('contextmenu', (e) => { e.preventDefault(); if (e.pointerType === 'touch' || (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents)) return; trashed ? this.trashMenu(card, n) : this.noteMenu(card, n); });
+    return card;
+  }
+
+  // ---- actions ----
+
+  currentFolderId() { return this.view.startsWith('folder:') ? this.view.slice(7) : null; }
+
+  async create({ record = false, pages, kind } = {}) {
+    const meta = await createNote({ subjectId: this.currentFolderId(), title: kind === 'quick' ? 'Nota rápida' : defaultTitle(), pages, kind });
+    if (record) sessionStorage.setItem('inknote.autorec', meta.id);
+    this.openNote(meta.id);
+  }
+
+  fromTemplate(open) {
+    templateGallery({
+      open,
+      onPick: (st) => {
+        const sz = SIZES[st.size];
+        const pages = Array.from({ length: st.count }, () => newPage({ w: sz.w, h: sz.h, template: st.template, color: st.color, tpl: st.tpl }));
+        this.create({ pages });
+      },
+    });
+  }
+
+  newMenu(anchor) {
+    menu(anchor, [
+      { label: 'Nueva nota', icon: 'pen', onClick: () => this.create() },
+      { label: 'Quick note (typed, lists & totals)', icon: 'nQuick', onClick: () => this.create({ kind: 'quick' }) },
+      { label: 'New note from template…', icon: 'template', onClick: () => this.fromTemplate() },
+      { label: 'New note & start recording', icon: 'mic', onClick: () => this.create({ record: true }) },
+      '-',
+      { label: 'Import PDF to annotate', icon: 'pdf', onClick: () => this.importPDF() },
+      { label: 'Import images as pages', icon: 'image', onClick: () => this.importImages() },
+      { label: 'Scan document', icon: 'scan', onClick: () => this.scan() },
+      { label: 'Import note / backup file', icon: 'upload', onClick: () => this.importNote() },
+    ]);
+  }
+
+  importMenu(anchor) {
+    menu(anchor, [
+      { label: 'PDF (annotate it)', icon: 'pdf', onClick: () => this.importPDF() },
+      { label: 'Images / photos as pages', icon: 'image', onClick: () => this.importImages() },
+      { label: 'Scan document with camera', icon: 'scan', onClick: () => this.scan() },
+      { label: 'Notes note or backup (.json)', icon: 'upload', onClick: () => this.importNote() },
+    ]);
+  }
+
+  async importPDF(file) {
+    if (!file) [file] = await pickFile('application/pdf,.pdf');
+    if (!file) return;
+    const pd = progressDialog('Importing PDF…');
+    try {
+      const pages = await pdfToPages(file, (i, n) => pd.set(i / n, `Page ${i} of ${n}`));
+      const meta = await createNote({ title: file.name.replace(/\.pdf$/i, ''), subjectId: this.currentFolderId(), pages });
+      pd.close();
+      this.openNote(meta.id);
+    } catch (e) { pd.close(); toast(e.message || 'Could not import PDF', 4000); }
+  }
+
+  async importImages(files) {
+    if (!files) files = await pickFile('image/*', true);
+    if (!files.length) return;
+    const pd = progressDialog('Importing images…');
+    try {
+      const pages = await imagesToPages(files);
+      const meta = await createNote({ title: files[0].name.replace(/\.[^.]+$/, ''), subjectId: this.currentFolderId(), pages });
+      pd.close();
+      this.openNote(meta.id);
+    } catch (e) { pd.close(); toast(e.message || 'Could not import images'); }
+  }
+
+  scan() {
+    const input = h('input', { type: 'file', accept: 'image/*', capture: 'environment', multiple: true, style: { display: 'none' } });
+    input.addEventListener('change', async () => {
+      const files = [...input.files];
+      input.remove();
+      if (!files.length) return;
+      const pd = progressDialog('Scanning…');
+      try {
+        const pages = await imagesToPages(files, { scan: true });
+        const meta = await createNote({ title: 'Scan ' + new Date().toLocaleDateString(), subjectId: this.currentFolderId(), pages });
+        pd.close();
+        this.openNote(meta.id);
+      } catch (e) { pd.close(); toast(e.message || 'Could not scan'); }
+    });
+    document.body.append(input);
+    input.click();
+  }
+
+  async importNote() { this.importFiles(await pickFile('.json,application/json', true)); }
+
+  async importFiles(files) {
+    let n = 0;
+    const imgs = files.filter((f) => f.type.startsWith('image/'));
+    if (imgs.length) { await this.importImages(imgs); return; }
+    for (const f of files) {
+      try {
+        if (/\.pdf$/i.test(f.name) || f.type === 'application/pdf') { await this.importPDF(f); return; }
+        n += await importFile(f);
+      } catch (e) { toast(`${f.name}: ${e.message}`, 4000); }
+    }
+    if (n) { toast(`Imported ${n} note${n > 1 ? 's' : ''}`); this.refresh(); }
+  }
+
+  sortMenu(anchor) {
+    const set = (v) => { settings.sort = v; saveSettings(); this.renderGrid(); };
+    menu(anchor, [
+      { label: 'Last edited', checked: settings.sort === 'updated', onClick: () => set('updated') },
+      { label: 'Date created', checked: settings.sort === 'created', onClick: () => set('created') },
+      { label: 'Title', checked: settings.sort === 'title', onClick: () => set('title') },
+    ]);
+  }
+
+  noteMenu(anchor, n) {
+    menu(anchor, [
+      { label: 'Open', icon: 'pen', onClick: () => this.openNote(n.id) },
+      { label: 'Rename', icon: 'text', onClick: async () => {
+        const t = await promptDialog('Rename note', n.title);
+        if (t) { n.title = t; await touchMeta(n); this.render(); }
+      } },
+      { label: n.starred ? 'Remove from Favorites' : 'Add to Favorites', icon: 'star', onClick: async () => { n.starred = !n.starred || undefined; if (!n.starred) delete n.starred; await touchMeta(n); this.render(); } },
+      { label: 'Move to folder…', icon: 'folder', onClick: () => this.moveMenu(anchor, n) },
+      { label: 'Duplicate', icon: 'duplicate', onClick: async () => { await duplicateNote(n); this.refresh(); } },
+      { label: 'Save to Google Drive', icon: 'nDrive', onClick: () => { db.get('bodies', n.id).then((b) => b && saveToDrive(n, b)); } },
+      n.kind === 'quick' ? null : { label: 'Export PDF', icon: 'pdf', onClick: async () => {
+        const body = await db.get('bodies', n.id);
+        const pd = progressDialog('Exporting PDF…');
+        try { await exportNotePDF(n, body, (f) => pd.set(f)); } catch (e) { toast(e.message); }
+        pd.close();
+      } },
+      { label: 'Export note file', icon: 'download', onClick: () => exportNoteFile(n) },
+      '-',
+      { label: 'Delete', icon: 'trash', danger: true, onClick: async () => { await trashNote(n); toast('Moved to Recently Deleted'); this.refresh(); } },
+    ]);
+  }
+
+  trashMenu(anchor, n) {
+    menu(anchor, [
+      { label: 'Restore', icon: 'restore', onClick: async () => { await restoreNote(n); toast('Restored'); this.refresh(); } },
+      { label: 'Delete forever', icon: 'trash', danger: true, onClick: async () => {
+        if (await confirmDialog(`Delete “${n.title}” forever?`, 'This cannot be undone, on any device.')) { await deleteForever(n.id); this.refresh(); }
+      } },
+    ]);
+  }
+
+  async emptyTrash() {
+    if (!(await confirmDialog('Empty Recently Deleted?', `${this.trash.length} note(s) will be deleted forever on every device.`))) return;
+    for (const n of this.trash) await deleteForever(n.id);
+    this.refresh();
+  }
+
+  moveMenu(anchor, n) {
+    const move = async (id) => { n.subjectId = id; await touchMeta(n); this.render(); };
+    menu(anchor, [
+      { label: 'No folder', checked: !n.subjectId, onClick: () => move(null) },
+      ...this.folders.map((s) => ({ label: s.name, checked: n.subjectId === s.id, onClick: () => move(s.id) })),
+      '-',
+      { label: 'New folder…', icon: 'plus', onClick: async () => { const s = await this.newFolder(); if (s) move(s.id); } },
+    ]);
+  }
+
+  async newFolder(value = '', quiet = false) {
+    const name = await promptDialog('Nueva carpeta', value, { placeholder: 'e.g. Biology', ok: 'Create' });
+    if (!name) return null;
+    const s = { id: uid(), name, color: FOLDER_COLORS[this.folders.length % FOLDER_COLORS.length], order: Date.now() };
+    await saveSubject(s);
+    if (!quiet) await this.refresh(); else this.folders.push(s);
+    return s;
+  }
+
+  folderMenu(anchor, s) {
+    const colors = h('div', { class: 'row wrap', style: { padding: '6px 10px' } }, FOLDER_COLORS.map((c) => h('button', {
+      class: 'swatch' + (s.color === c ? ' on' : ''), style: { background: c }, 'aria-label': 'Colour',
+      onClick: async () => { s.color = c; await saveSubject(s); closePopover(); this.render(); },
+    })));
+    popover(anchor, h('div', { class: 'menu' },
+      h('button', { class: 'menu-item', onClick: async () => {
+        closePopover();
+        const name = await promptDialog('Rename folder', s.name);
+        if (name) { s.name = name; await saveSubject(s); this.render(); }
+      } }, h('span', { class: 'mi-icon', html: icons.text }), h('span', {}, 'Rename')),
+      colors,
+      h('div', { class: 'menu-sep' }),
+      h('button', { class: 'menu-item danger', onClick: async () => {
+        closePopover();
+        if (!(await confirmDialog(`Delete folder “${s.name}”?`, 'Notes inside are kept.'))) return;
+        for (const n of this.notes) if (n.subjectId === s.id) { n.subjectId = null; await touchMeta(n); }
+        await deleteSubject(s);
+        this.refresh();
+      } }, h('span', { class: 'mi-icon', html: icons.trash }), h('span', {}, 'Delete folder'))));
+  }
+
+  // ---------------------------------------------------------------- settings --
+
+  settingsSheet(start = 'account') {
+    let tab = start;
+    const nav = h('nav', { class: 'set-nav' });
+    const pane = h('div', { class: 'set-pane' });
+    const S = sheet(h('div', { class: 'settings-wrap' }, nav, pane), { className: 'settings-sheet' });
+    const tabs = [['account', 'Account'], ['writing', 'Writing & Pencil'], ['appearance', 'Appearance'], ['backup', 'Backup & data'], ['trash', 'Eliminadas'], ['help', 'Help']];
+    const show = (t) => {
+      tab = t;
+      nav.innerHTML = '';
+      tabs.forEach(([k, l]) => nav.append(h('button', { class: 'set-tab' + (k === tab ? ' on' : ''), onClick: () => k === 'trash' ? (S.close(), this.go('trash')) : show(k) }, l)));
+      pane.innerHTML = '';
+      pane.append(h('div', { class: 'set-head' }, h('h2', {}, tabs.find((x) => x[0] === t)[1]), h('div', { class: 'grow' }), h('button', { class: 'icon-btn', 'aria-label': 'Close', html: icons.close, onClick: () => S.close() })));
+      pane.append(this['set_' + t](() => show(t), S));
+    };
+    show(tab);
+  }
+
+  set_account(again) {
+    const a = account();
+    if (!a) {
+      let mode = 'in';
+      const box = h('div', { class: 'set-body auth' });
+      const gSlot = h('div', { class: 'google-slot' });
+      const google = h('div', { class: 'google-wrap', hidden: true }, gSlot, h('div', { class: 'auth-or' }, h('span', {}, 'or use email')));
+      this.mountGoogleButton(gSlot, google, () => { toast('Signed in with Google — syncing your notes'); again(); });
+      const draw = () => {
+        box.innerHTML = '';
+        const email = h('input', { class: 'input', type: 'email', placeholder: 'Correo electrónico', autocomplete: 'email', inputmode: 'email' });
+        const pass = h('input', { class: 'input', type: 'password', placeholder: mode === 'in' ? 'Contraseña' : 'Choose a password (8+ characters)', autocomplete: mode === 'in' ? 'current-password' : 'new-password' });
+        const name = h('input', { class: 'input', placeholder: 'Your name (optional)', autocomplete: 'name' });
+        const err = h('p', { class: 'err' });
+        const go = async () => {
+          err.textContent = '';
+          if (!email.value.trim()) { err.textContent = 'Enter your email address'; email.focus(); return; }
+          if (pass.value.length < (mode === 'in' ? 1 : 8)) { err.textContent = mode === 'in' ? 'Enter your password' : 'Password needs at least 8 characters'; pass.focus(); return; }
+          btn.disabled = true;
+          btn.textContent = mode === 'in' ? 'Signing in…' : 'Creating account…';
+          try {
+            if (mode === 'in') await signIn(email.value, pass.value);
+            else await signUp(email.value, pass.value, name.value);
+            toast('Signed in — syncing your notes');
+            again();
+            return;
+          } catch (e) { err.textContent = e.message; }
+          btn.disabled = false;
+          btn.textContent = mode === 'in' ? 'Iniciar sesión' : 'Create account';
+        };
+        for (const i of [email, pass, name]) i.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+        const btn = h('button', { class: 'btn primary block big', onClick: go }, mode === 'in' ? 'Iniciar sesión' : 'Create account');
+        const tabs = h('div', { class: 'seg auth-tabs' },
+          h('button', { class: mode === 'in' ? 'on' : '', onClick: () => { mode = 'in'; draw(); } }, 'Iniciar sesión'),
+          h('button', { class: mode === 'up' ? 'on' : '', onClick: () => { mode = 'up'; draw(); } }, 'Create account'));
+        const fields = [email, pass];
+        if (mode === 'up') fields.unshift(name);
+        box.append(
+          h('div', { class: 'auth-hero' }, h('span', { class: 'auth-ico', html: icons.cloud }),
+            h('h3', {}, mode === 'in' ? 'Welcome back' : 'Create your free account'),
+            h('p', { class: 'muted' }, 'Sync notes between your iPad, phone and computer. Everything keeps working offline and syncs when you are back online.')),
+          google,
+          tabs, ...fields, err, btn,
+          h('p', { class: 'muted small center' }, 'Your notes stay on this device too — signing in only adds sync & backup.'));
+      };
+      draw();
+      return box;
+    }
+    const st = getStatus();
+    const nameRow = h('div', { class: 'set-card row' }, h('span', { class: 'grow' }, a.user.name || '—'),
+      h('button', { class: 'link-btn', onClick: async () => { const n = await promptDialog('Preferred name', a.user.name); if (n) { try { await updateName(n); again(); } catch (e) { toast(e.message); } } } }, 'Edit'));
+    const faq = (q, ans) => { const d = h('details', { class: 'set-card faq' }, h('summary', {}, q), h('p', { class: 'muted' }, ans)); return d; };
+    return h('div', { class: 'set-body' },
+      h('div', { class: 'acct-banner pattern' }),
+      h('div', { class: 'set-card' }, h('div', { class: 'row' }, h('b', { class: 'grow' }, a.user.email), a.user.google ? h('span', { class: 'chip' }, 'Google') : null),
+        h('button', { class: 'link-btn', onClick: async () => {
+          await signOut();
+          toast('Signed out — your notes stay on this device');
+          again();
+        } }, 'Log out')),
+      h('h4', {}, 'Preferred name'), nameRow,
+      h('h4', {}, 'Sync'),
+      h('div', { class: 'set-card row' }, h('span', { class: 'grow' }, st.state === 'synced' ? 'Up to date · ' + timeAgo(st.last) : st.state === 'offline' ? 'Offline — will sync when you are back online' : st.state === 'syncing' ? 'Syncing…' : st.error || 'Waiting'),
+        h('button', { class: 'link-btn', onClick: async () => { await syncNow(); again(); } }, 'Sincronizar ahora')),
+      h('h4', {}, 'FAQ'),
+      faq('How do I sync notes across devices?', 'Sign in with the same email on every device (iPad, phone, computer). Notes, folders, images, PDFs and recordings sync automatically in the background.'),
+      faq('Does it work offline?', 'Yes. Everything is saved on the device first. When you reconnect, changes upload and download by themselves.'),
+      faq('What if I edit the same note on two devices?', 'Both sets of changes are kept: when the devices sync, the edits are merged, even if one of them was offline.'));
+  }
+
+  // "Continue with Google" — shown when the server has a Google client id.
+  async mountGoogleButton(slot, wrap, done) {
+    const cfg = await serverConfig();
+    if (!cfg.googleClientId) return;
+    try {
+      await loadScript('https://accounts.google.com/gsi/client');
+      const g = window.google && window.google.accounts && window.google.accounts.id;
+      if (!g) return;
+      g.initialize({
+        client_id: cfg.googleClientId,
+        ux_mode: 'popup',
+        callback: async (r) => {
+          try { await signInGoogle(r.credential); done(); } catch (e) { toast(e.message, 4000); }
+        },
+      });
+      wrap.hidden = false;
+      slot.innerHTML = '';
+      const w = Math.min(400, Math.max(220, slot.getBoundingClientRect().width || 320));
+      g.renderButton(slot, { theme: document.documentElement.dataset.theme === 'dark' ? 'filled_black' : 'outline', size: 'large', shape: 'pill', text: 'continue_with', width: w, logo_alignment: 'center' });
+    } catch { wrap.hidden = true; }
+  }
+
+  set_writing() {
+    const seg = (key, opts) => h('div', { class: 'seg' }, opts.map(([v, label]) => h('button', {
+      class: settings[key] === v ? 'on' : '',
+      onClick: (e) => { settings[key] = v; saveSettings(); [...e.currentTarget.parentNode.children].forEach((b) => b.classList.toggle('on', b === e.currentTarget)); },
+    }, label)));
+    const toggle = (key, label, hint) => {
+      const cb = h('input', { type: 'checkbox', checked: settings[key] });
+      cb.addEventListener('change', () => { settings[key] = cb.checked; saveSettings(); });
+      return h('label', { class: 'toggle' }, h('span', {}, h('b', {}, label), hint ? h('small', {}, hint) : null), cb);
+    };
+    return h('div', { class: 'set-body' },
+      h('h4', {}, 'Draw with finger'),
+      seg('fingerDraw', [['auto', 'Auto'], ['on', 'On'], ['off', 'Off']]),
+      h('p', { class: 'muted small' }, 'Auto: fingers draw until an Apple Pencil or stylus is used — then fingers only scroll and zoom (palm rejection).'),
+      toggle('pressure', 'Pressure sensitivity', 'Line width follows Apple Pencil pressure'),
+      toggle('shapeHold', 'Draw & hold for shapes', 'Hold at the end of a stroke to snap to a line, circle, rectangle…'),
+      toggle('eraserAutoDeselect', 'Eraser returns to previous tool', 'After erasing you are back on the pen automatically'),
+      toggle('twoFingerUndo', 'Gestures', '2-finger tap undo · 3-finger tap redo · 3-finger swipe down copy/paste · 4-finger tap full screen'),
+      toggle('autoAddPage', 'Add pages automatically', 'A new page appears when you write near the bottom of the last one'));
+  }
+
+  set_appearance() {
+    const seg = h('div', { class: 'seg' }, [['light', 'Light'], ['dark', 'Dark'], ['system', 'Match device']].map(([v, l]) => h('button', {
+      class: settings.theme === v ? 'on' : '',
+      onClick: (e) => { settings.theme = v; saveSettings(); applyTheme(); [...e.currentTarget.parentNode.children].forEach((b) => b.classList.toggle('on', b === e.currentTarget)); },
+    }, l)));
+    return h('div', { class: 'set-body' }, h('h4', {}, 'Theme'), seg,
+      h('p', { class: 'muted small' }, 'Install Notes like an app: on iPad/iPhone tap Share → Add to Home Screen; on a computer use the install button in the address bar.'));
+  }
+
+  set_backup() {
+    return h('div', { class: 'set-body' },
+      h('p', { class: 'muted' }, 'A backup file contains every note, folder, image, PDF and recording. Keep one somewhere safe, or use it to move notes without an account.'),
+      h('div', { class: 'row wrap' },
+        h('button', { class: 'btn', onClick: () => exportBackup() }, h('span', { html: icons.download }), 'Export backup'),
+        h('button', { class: 'btn', onClick: () => this.importNote() }, h('span', { html: icons.upload }), 'Import backup')),
+      h('h4', {}, 'Google Drive'),
+      h('p', { class: 'muted small' }, driveInfo().lastBackup ? 'Last backup: ' + new Date(driveInfo().lastBackup).toLocaleString() : 'Keep a copy of all your notes in your Google Drive (folder “Notes”).'),
+      h('div', { class: 'row wrap' },
+        h('button', { class: 'btn', onClick: () => backupToDrive() }, h('span', { html: icons.nDrive }), 'Back up now'),
+        h('button', { class: 'btn', onClick: (e) => restoreFromDrive(e.currentTarget, () => this.refresh()) }, h('span', { html: icons.restore }), 'Restore')),
+      h('h4', {}, 'Storage'), (() => {
+        const p = h('p', { class: 'muted small' }, 'Checking…');
+        if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then((e) => { p.textContent = `Using ${(e.usage / 1048576).toFixed(1)} MB on this device.`; });
+        else p.textContent = '';
+        return p;
+      })());
+  }
+
+  set_help() {
+    return h('div', { class: 'set-body' },
+      h('p', {}, 'Notes is free and open source.'),
+      h('p', { class: 'muted small' }, 'Version ' + APP_VERSION),
+      h('table', { class: 'help-table' }, [
+        ['Two-finger tap', 'Undo'], ['Two-finger hold', 'Rapid undo'], ['Three-finger tap', 'Redo'], ['Three-finger swipe down', 'Copy & paste menu'],
+        ['Four-finger tap', 'Full screen'], ['Quick pinch in', 'Fit page'], ['Draw & hold', 'Perfect shape'], ['Tap a tool again', 'More options'],
+      ].map(([a, b]) => h('tr', {}, h('td', {}, a), h('td', {}, b)))),
+      h('a', { class: 'btn', href: REPO, target: '_blank', rel: 'noopener' }, h('span', { html: icons.github }), 'Source code & issues on GitHub'));
+  }
+}
+

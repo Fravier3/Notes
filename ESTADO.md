@@ -1,0 +1,9 @@
+# Estado
+
+Última actualización: 2026-11-24, Codex.
+
+- Objetivo: PWA para notas con Apple Pencil y sincronización privada en FraviOrg 2.
+- Stack: Inknote, Vite, IndexedDB, PDF.js y Supabase Auth, Postgres y Storage.
+- Implementado: editor, biblioteca, PWA y adaptador de sincronización.
+- Pendiente: verificar registro, sincronización entre dispositivos, instalación y trazos con Apple Pencil físico.
+- Pruebas: `npm install`, `npm run build`, `npm run preview`. Crear una nota sin red, cerrar y reabrir. Iniciar sesión en dos dispositivos y comprobar cambios y archivos adjuntos.
