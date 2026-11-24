@@ -119,7 +119,7 @@ export class Library {
     if (!a) {
       C.append(h('b', {}, 'Sync across devices'),
         h('p', {}, 'Your notes are saved on this device. Sign in to back them up and sync with your iPad, phone and computer.'),
-        h('button', { class: 'btn primary block', onClick: () => this.settingsSheet('account') }, 'Sign in / Create account'));
+        h('button', { class: 'btn primary block', onClick: () => this.settingsSheet('account') }, 'Entrar o crear cuenta'));
       return;
     }
     const label = { syncing: 'Syncing…', synced: 'Synced · ' + timeAgo(st.last || Date.now()), offline: 'Offline — saved on this device', error: 'Sync paused — will retry', idle: 'Waiting to sync' }[st.state] || 'Synced';
@@ -687,8 +687,8 @@ export class Library {
       const draw = () => {
         box.innerHTML = '';
         const email = h('input', { class: 'input', type: 'email', placeholder: 'Correo electrónico', autocomplete: 'email', inputmode: 'email' });
-        const pass = h('input', { class: 'input', type: 'password', placeholder: mode === 'in' ? 'Contraseña' : 'Choose a password (8+ characters)', autocomplete: mode === 'in' ? 'current-password' : 'new-password' });
-        const name = h('input', { class: 'input', placeholder: 'Your name (optional)', autocomplete: 'name' });
+        const pass = h('input', { class: 'input', type: 'password', placeholder: mode === 'in' ? 'Contraseña' : 'Contraseña de 8 caracteres o más', autocomplete: mode === 'in' ? 'current-password' : 'new-password' });
+        const name = h('input', { class: 'input', placeholder: 'Tu nombre (opcional)', autocomplete: 'name' });
         const err = h('p', { class: 'err' });
         const go = async () => {
           err.textContent = '';
@@ -699,23 +699,23 @@ export class Library {
           try {
             if (mode === 'in') await signIn(email.value, pass.value);
             else await signUp(email.value, pass.value, name.value);
-            toast('Signed in — syncing your notes');
+            toast('Sesión iniciada. Sincronizando tus notas.');
             again();
             return;
           } catch (e) { err.textContent = e.message; }
           btn.disabled = false;
-          btn.textContent = mode === 'in' ? 'Iniciar sesión' : 'Create account';
+          btn.textContent = mode === 'in' ? 'Iniciar sesión' : 'Crear cuenta';
         };
         for (const i of [email, pass, name]) i.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
-        const btn = h('button', { class: 'btn primary block big', onClick: go }, mode === 'in' ? 'Iniciar sesión' : 'Create account');
+        const btn = h('button', { class: 'btn primary block big', onClick: go }, mode === 'in' ? 'Iniciar sesión' : 'Crear cuenta');
         const tabs = h('div', { class: 'seg auth-tabs' },
           h('button', { class: mode === 'in' ? 'on' : '', onClick: () => { mode = 'in'; draw(); } }, 'Iniciar sesión'),
-          h('button', { class: mode === 'up' ? 'on' : '', onClick: () => { mode = 'up'; draw(); } }, 'Create account'));
+          h('button', { class: mode === 'up' ? 'on' : '', onClick: () => { mode = 'up'; draw(); } }, 'Crear cuenta'));
         const fields = [email, pass];
         if (mode === 'up') fields.unshift(name);
         box.append(
           h('div', { class: 'auth-hero' }, h('span', { class: 'auth-ico', html: icons.cloud }),
-            h('h3', {}, mode === 'in' ? 'Welcome back' : 'Create your free account'),
+            h('h3', {}, mode === 'in' ? 'Qué bueno verte' : 'Crea tu cuenta'),
             h('p', { class: 'muted' }, 'Sync notes between your iPad, phone and computer. Everything keeps working offline and syncs when you are back online.')),
           google,
           tabs, ...fields, err, btn,

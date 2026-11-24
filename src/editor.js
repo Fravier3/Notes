@@ -2470,11 +2470,13 @@ export class Editor {
       card(
         row('Template settings', 'nTemplate', () => this.paperMenu(anchor)),
         row('Page thumbnails', 'nPages', () => this.togglePagesPanel()),
-        row('View settings', '', () => this.viewMenu(anchor), { chev: true })),
+        row(settings.fingerDraw === 'off' ? 'Activar modo automático' : 'Escribir solo con Apple Pencil', 'nPenOff',
+          () => this.setFinger(settings.fingerDraw === 'off' ? 'auto' : 'off'), { sub: 'Desplázate con los dedos sin dejar trazos' }),
+        row('Ajustes de vista', '', () => this.viewMenu(anchor), { chev: true })),
       card(row(this.meta.title, '', () => this.noteMenu(anchor), { sub: synced, chev: true })),
       card(this.inSplit()
         ? row('Close this side', 'nSide', () => this.exit())
-        : row('Side by side', 'nSide', () => this.splitMenu(anchor), { badge: 'New' })),
+        : row('Side by side', 'nSide', () => this.splitMenu(anchor), {})),
       h('div', { class: 'np-card np-foots' },
         h('button', { class: 'np-foot', title: 'Writing settings', 'aria-label': 'Writing settings', html: icons.nGear, onClick: () => this.writingSettings(anchor) }),
         lockBtn)), { className: 'np-pop' });
@@ -2566,7 +2568,7 @@ export class Editor {
     settings.fingerDraw = v;
     saveSettings();
     this.renderToolbar();
-    toast(fingerDraws() ? 'Fingers draw · two fingers scroll' : 'Fingers scroll · Pencil draws');
+    toast(fingerDraws() ? 'Escritura táctil activa' : 'Apple Pencil para escribir · dedos para desplazar');
   }
 
   async exportPDF() {

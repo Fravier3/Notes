@@ -9,7 +9,7 @@ import { bodyIds, mergeBodies } from './notes.js';
 import { fontSyncState, fontsDirty, markFontsSynced, applyRemoteFonts } from './fonts.js';
 
 const KEY = 'inknote.account';
-import { notesApi } from './cloud.js';
+
 
 let acct = load();
 let signingOut = false;
@@ -32,7 +32,10 @@ export function getStatus() { return status; }
 export function account() { return acct; }
 
 async function api(path, options = {}) {
-  return notesApi(path, options, acct?.user.id);
+  if (path === '/config') return Response.json({});
+  const owner = acct?.user.id;
+  const { notesApi } = await import('./cloud.js');
+  return notesApi(path, options, owner);
 }
 const apiJSON = async (path, opts) => (await api(path, opts)).json();
 
