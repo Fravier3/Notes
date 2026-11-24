@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import sharp from 'sharp';
 import { defineConfig } from 'vite';
 
@@ -10,13 +10,22 @@ export default defineConfig({
     name: 'notes-offline-shell',
     apply: 'build',
     async writeBundle(_options, output) {
-      const icons = [180, 192, 512].map((size) => `icons/icon-${size}.png`);
-      await Promise.all(icons.map((name, index) => sharp('public/icons/icon.svg')
-        .resize([180, 192, 512][index]).png().toFile('dist/' + name)));
-      const assets = ['index.html', 'manifest.webmanifest', 'icons/icon.svg', ...icons,
+      const artwork = await readFile('assets/notes-icon.jpg');
+      const sizes = [180, 192, 512];
+      const icons = sizes.map((size) => `icons/notes-v2-${size}.png`);
+      const maskable = 'icons/notes-v2-maskable.png';
+      const padded = await sharp(artwork).resize(416, 416).extend({
+        top: 48, bottom: 48, left: 48, right: 48, background: '#070875',
+      }).png().toBuffer();
+      await Promise.all([
+        ...sizes.map((size, index) => sharp(artwork).resize(size, size)
+          .png({ palette: true, colours: 256 }).toFile('dist/' + icons[index])),
+        sharp(padded).png({ palette: true, colours: 256 }).toFile('dist/' + maskable),
+      ]);
+      const assets = ['index.html', 'manifest.webmanifest', ...icons, maskable,
         'fonts/figtree-latin-600-normal.woff2', 'fonts/figtree-latin-700-normal.woff2',
         'fonts/figtree-latin-800-normal.woff2', ...Object.keys(output).filter((name) => name.startsWith('assets/'))];
-      const version = createHash('sha256').update(assets.join('\n')).digest('hex').slice(0, 16);
+      const version = createHash('sha256').update(assets.join('\n')).update(artwork).digest('hex').slice(0, 16);
       await writeFile('dist/sw.js', `
 const prefix = 'notes-shell-';
 const cacheName = prefix + '${version}';
