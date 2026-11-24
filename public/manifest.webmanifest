@@ -14,17 +14,17 @@
   ],
   "icons": [
     {
-      "src": "icons/notes-v2-192.png",
+      "src": "icons/notes-v3-192.png",
       "sizes": "192x192",
       "type": "image/png"
     },
     {
-      "src": "icons/notes-v2-512.png",
+      "src": "icons/notes-v3-512.png",
       "sizes": "512x512",
       "type": "image/png"
     },
     {
-      "src": "icons/notes-v2-maskable.png",
+      "src": "icons/notes-v3-maskable.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

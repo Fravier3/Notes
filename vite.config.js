@@ -11,15 +11,15 @@ export default defineConfig({
     apply: 'build',
     async writeBundle(_options, output) {
       const artwork = await readFile('assets/notes-icon.jpg');
-      const sizes = [180, 192, 512];
-      const icons = sizes.map((size) => `icons/notes-v2-${size}.png`);
-      const maskable = 'icons/notes-v2-maskable.png';
+      const sizes = [167, 180, 192, 512];
+      const icons = sizes.map((size) => size === 180 ? "apple-touch-icon.png" : `icons/notes-v3-${size}.png`);
+      const maskable = 'icons/notes-v3-maskable.png';
       const padded = await sharp(artwork).resize(416, 416).extend({
         top: 48, bottom: 48, left: 48, right: 48, background: '#070875',
       }).png().toBuffer();
       await Promise.all([
         ...sizes.map((size, index) => sharp(artwork).resize(size, size)
-          .png({ palette: true, colours: 256 }).toFile('dist/' + icons[index])),
+          .png().toFile('dist/' + icons[index])),
         sharp(padded).png({ palette: true, colours: 256 }).toFile('dist/' + maskable),
       ]);
       const assets = ['index.html', 'manifest.webmanifest', ...icons, maskable,
@@ -32,7 +32,7 @@ const cacheName = prefix + '${version}';
 const scope = self.registration.scope;
 const files = new Set(${JSON.stringify(assets)}.map((file) => new URL(file, scope).href));
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(cacheName).then((cache) => cache.addAll([...files])).then(() => self.skipWaiting()));
+  event.waitUntil(caches.open(cacheName).then((cache) => cache.addAll([...files].map((url) => new Request(url, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (event) => {
   event.waitUntil(caches.keys().then((keys) => Promise.all(keys
