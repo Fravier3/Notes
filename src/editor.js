@@ -552,7 +552,10 @@ export class Editor {
       let extra = null;
       if (!L.shape && !L.straight) {
         extra = [L.raw.x, L.raw.y, L.lastP];
-        if (L.pred) extra.push(L.pred.x, L.pred.y, L.lastP);
+        if (L.pred && performance.now() < L.pred.until) {
+          extra.push(L.pred.x, L.pred.y, L.lastP);
+          this.requestLive();
+        }
       }
       drawLiveStroke(ctx, D, extra);
       ctx.__dark = false;
@@ -816,23 +819,45 @@ export class Editor {
     if (p.role !== 'draw') return;
     let evs = e.getCoalescedEvents ? e.getCoalescedEvents() : null;
     if (!evs || !evs.length) evs = [e];
+    if (p.type === 'pen') window.__inkInput = performance.now();
     for (const ev of evs) {
       const pos = this.localPos(ev);
       p.sx = pos.x; p.sy = pos.y;
       this.moveTool(p, ev);
     }
     const L = this.live;
-    if (L && L.pid === p.id) {
-      L.pred = null;
-      const pe = e.getPredictedEvents ? e.getPredictedEvents() : null;
-      if (pe && pe.length && !L.shape && !L.edge && !L.straight) {
-        const q = this.localPos(pe[pe.length - 1]), d = this.screenToDoc(q.x, q.y);
-        // only trust short predictions (avoids overshoot at sharp turns)
-        if (Math.hypot(q.x - p.sx, q.y - p.sy) < 14) L.pred = { x: d.x - L.o.x, y: d.y - L.o.y };
-      }
-    }
+    if (L && L.pid === p.id) this.predictInkTip(L, p, e);
     if (this.tool === 'eraser' || this.eraserOverride) this.hover = { x: p.sx, y: p.sy };
     this.requestLive();
+  }
+
+  predictInkTip(stroke, pointer, event) {
+    stroke.pred = null;
+    if (!stroke.pen || stroke.shape || stroke.edge || stroke.straight) return;
+    const until = performance.now() + 24;
+    const predicted = event.getPredictedEvents?.();
+    if (predicted?.length) {
+      const tip = this.localPos(predicted.at(-1));
+      const distance = Math.hypot(tip.x - pointer.sx, tip.y - pointer.sy);
+      if (distance < 14) {
+        const doc = this.screenToDoc(tip.x, tip.y);
+        stroke.pred = { x: doc.x - stroke.o.x, y: doc.y - stroke.o.y, until };
+        return;
+      }
+    }
+
+    // Where native prediction is unavailable, extend only steady Pencil motion.
+    // Keep the extension temporary so corners and saved strokes use actual input.
+    const { motion } = stroke;
+    if (!motion?.steady || event.timeStamp - stroke.sampleTime > 20) return;
+    const distance = Math.hypot(motion.x, motion.y);
+    if (distance < 0.35) return;
+    const lead = Math.min(6 / this.cam.s, distance * 6 / motion.ms);
+    stroke.pred = {
+      x: stroke.raw.x + motion.x * lead / distance,
+      y: stroke.raw.y + motion.y * lead / distance,
+      until,
+    };
   }
 
   onUp(e, cancelled = false) {
@@ -1076,7 +1101,7 @@ export class Editor {
         o, pid: p.id, tool: t, style: t === 'pen' ? (this.toolCfg('pen').style || 'fountain') : undefined,
         color: this.currentColor(t), size, edge: edge || null, straight: t === 'hl' && !!this.toolCfg('hl').straight,
         pts: [round2(lx), round2(ly), pr], lastP: pr, sx: lx, sy: ly, raw: { x: lx, y: ly },
-        holdRef: { x: p.sx, y: p.sy }, startT: performance.now(), shape: false, pen: e.pointerType === 'pen',
+        sampleTime: e.timeStamp, holdRef: { x: p.sx, y: p.sy }, startT: performance.now(), shape: false, pen: e.pointerType === 'pen',
       };
       if (t === 'laser') { L.end = 0; this.lasers.push(L); this.laser = L; }
       else { this.live = L; this.armHold(); }
@@ -1120,13 +1145,22 @@ export class Editor {
         L.sx = lx; L.sy = ly;
         return;
       }
-      if (Math.hypot(lx - L.raw.x, ly - L.raw.y) < 0.6 / this.cam.s) return;
+      const dx = lx - L.raw.x, dy = ly - L.raw.y;
+      const distance = Math.hypot(dx, dy);
+      if (distance < (L.pen ? 0.4 : 0.6) / this.cam.s) { L.motion = null; return; }
+      const ms = ev.timeStamp - L.sampleTime;
+      const previous = L.motion;
+      L.motion = L.pen && ms > 0 && ms <= 25
+        ? { x: dx, y: dy, ms, steady: !!previous &&
+          dx * previous.x + dy * previous.y > 0.9 * distance * Math.hypot(previous.x, previous.y) }
+        : null;
+      L.sampleTime = ev.timeStamp;
       L.raw = { x: lx, y: ly };
       // pressure is smoothed so the line width never "shivers"
       const target = this.pressure(ev, L);
       const pr = L.lastP + (target - L.lastP) * 0.32;
       // light position smoothing; the curve fitting does the rest
-      const k = L.pen ? 0.5 : 0.45;
+      const k = L.pen ? 0.72 : 0.45;
       L.sx += (lx - L.sx) * k; L.sy += (ly - L.sy) * k;
       L.pts.push(round2(L.sx), round2(L.sy), Math.round(pr * 1000) / 1000);
       L.lastP = pr;
