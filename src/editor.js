@@ -547,13 +547,11 @@ export class Editor {
       ctx.__dark = isDarkPaper(L.o.page.color) && !L.o.page.bg;
       const D = L.draw && L.draw.pts === L.pts ? L.draw : (L.draw = { type: 'stroke', tool: L.tool, style: L.style, color: L.color, size: L.size, pts: L.pts });
       D.shape = L.shape; D.closed = L.closed;
-      // the tip follows the pen exactly (stored points are lightly smoothed),
-      // plus the browser's predicted position when it offers one
       let extra = null;
       if (!L.shape && !L.straight) {
-        extra = [L.raw.x, L.raw.y, L.lastP];
+        if (!L.pen) extra = [L.raw.x, L.raw.y, L.lastP];
         if (L.pred && performance.now() < L.pred.until) {
-          extra.push(L.pred.x, L.pred.y, L.lastP);
+          extra = [L.pred.x, L.pred.y, L.lastP];
           this.requestLive();
         }
       }
@@ -833,31 +831,23 @@ export class Editor {
 
   predictInkTip(stroke, pointer, event) {
     stroke.pred = null;
-    if (!stroke.pen || stroke.shape || stroke.edge || stroke.straight) return;
-    const until = performance.now() + 24;
+    if (!stroke.pen || stroke.shape || stroke.edge || stroke.straight || stroke.pts.length < 9) return;
     const predicted = event.getPredictedEvents?.();
-    if (predicted?.length) {
-      const tip = this.localPos(predicted.at(-1));
-      const distance = Math.hypot(tip.x - pointer.sx, tip.y - pointer.sy);
-      if (distance < 14) {
-        const doc = this.screenToDoc(tip.x, tip.y);
-        stroke.pred = { x: doc.x - stroke.o.x, y: doc.y - stroke.o.y, until };
-        return;
-      }
-    }
+    if (!predicted?.length) return;
 
-    // Where native prediction is unavailable, extend only steady Pencil motion.
-    // Keep the extension temporary so corners and saved strokes use actual input.
-    const { motion } = stroke;
-    if (!motion?.steady || event.timeStamp - stroke.sampleTime > 20) return;
-    const distance = Math.hypot(motion.x, motion.y);
-    if (distance < 0.35) return;
-    const lead = Math.min(6 / this.cam.s, distance * 6 / motion.ms);
-    stroke.pred = {
-      x: stroke.raw.x + motion.x * lead / distance,
-      y: stroke.raw.y + motion.y * lead / distance,
-      until,
-    };
+    const tip = this.localPos(predicted[0]);
+    const dx = tip.x - pointer.sx, dy = tip.y - pointer.sy;
+    const distance = Math.hypot(dx, dy);
+    const pts = stroke.pts, n = pts.length;
+    const vx = pts[n - 3] - pts[n - 6], vy = pts[n - 2] - pts[n - 5];
+    const length = Math.hypot(vx, vy);
+    const previousX = pts[n - 6] - pts[n - 9], previousY = pts[n - 5] - pts[n - 8];
+    // A small, forward-only preview avoids a visible snap when the Pencil lifts.
+    if (length * this.cam.s < 0.8 || distance < 0.5 || distance > 12) return;
+    if (vx * dx + vy * dy < 0.95 * length * distance) return;
+    if (vx * previousX + vy * previousY < 0.95 * length * Math.hypot(previousX, previousY)) return;
+    const advance = Math.min(distance, 2, length * this.cam.s / 2) / (distance * this.cam.s);
+    stroke.pred = { x: stroke.raw.x + dx * advance, y: stroke.raw.y + dy * advance, until: performance.now() + 16 };
   }
 
   onUp(e, cancelled = false) {
@@ -1101,7 +1091,7 @@ export class Editor {
         o, pid: p.id, tool: t, style: t === 'pen' ? (this.toolCfg('pen').style || 'fountain') : undefined,
         color: this.currentColor(t), size, edge: edge || null, straight: t === 'hl' && !!this.toolCfg('hl').straight,
         pts: [round2(lx), round2(ly), pr], lastP: pr, sx: lx, sy: ly, raw: { x: lx, y: ly },
-        sampleTime: e.timeStamp, holdRef: { x: p.sx, y: p.sy }, startT: performance.now(), shape: false, pen: e.pointerType === 'pen',
+        holdRef: { x: p.sx, y: p.sy }, startT: performance.now(), shape: false, pen: e.pointerType === 'pen',
       };
       if (t === 'laser') { L.end = 0; this.lasers.push(L); this.laser = L; }
       else { this.live = L; this.armHold(); }
@@ -1145,22 +1135,14 @@ export class Editor {
         L.sx = lx; L.sy = ly;
         return;
       }
-      const dx = lx - L.raw.x, dy = ly - L.raw.y;
-      const distance = Math.hypot(dx, dy);
-      if (distance < (L.pen ? 0.4 : 0.6) / this.cam.s) { L.motion = null; return; }
-      const ms = ev.timeStamp - L.sampleTime;
-      const previous = L.motion;
-      L.motion = L.pen && ms > 0 && ms <= 25
-        ? { x: dx, y: dy, ms, steady: !!previous &&
-          dx * previous.x + dy * previous.y > 0.9 * distance * Math.hypot(previous.x, previous.y) }
-        : null;
-      L.sampleTime = ev.timeStamp;
+      if (Math.hypot(lx - L.raw.x, ly - L.raw.y) < (L.pen ? 0.35 : 0.6) / this.cam.s) return;
       L.raw = { x: lx, y: ly };
       // pressure is smoothed so the line width never "shivers"
       const target = this.pressure(ev, L);
       const pr = L.lastP + (target - L.lastP) * 0.32;
-      // light position smoothing; the curve fitting does the rest
-      const k = L.pen ? 0.72 : 0.45;
+      // Pencil input already passes through the midpoint curve. Using its actual
+      // coordinates keeps the live and committed endpoints aligned.
+      const k = L.pen ? 1 : 0.45;
       L.sx += (lx - L.sx) * k; L.sy += (ly - L.sy) * k;
       L.pts.push(round2(L.sx), round2(L.sy), Math.round(pr * 1000) / 1000);
       L.lastP = pr;
@@ -1246,7 +1228,7 @@ export class Editor {
       if (hit) { this.tapItem(L.o, hit, 'pen'); this.requestLive(); return; }
     }
     let pts = L.pts;
-    if (!L.shape && !L.straight && pts.length > 3) {
+    if (!L.pen && !L.shape && !L.straight && pts.length > 3) {
       const n = pts.length;
       if (Math.hypot(pts[n - 3] - L.raw.x, pts[n - 2] - L.raw.y) > 0.3) pts = pts.concat([round2(L.raw.x), round2(L.raw.y), L.lastP]);
     }
