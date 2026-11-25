@@ -12,7 +12,7 @@ import { putAsset, assetURL, db, getAssetBlob } from './db.js';
 import { saveNote, makeThumb, newPage, exportNotePDF, exportNoteFile, pdfToPages, imagesToPages, bodyIds, mergeBodies } from './notes.js';
 import { onStatus } from './sync.js';
 import { importPDF } from './pdf.js';
-import { popover, menu, closePopover, confirmDialog, progressDialog, colorPopover, sliderPopover, promptDialog } from './ui.js';
+import { popover, menu, closePopover, confirmDialog, progressDialog, colorPopover, sliderPopover, promptDialog, guardPencilButtons } from './ui.js';
 import { fontStack, loadFont } from './fonts.js';
 import { fontPicker } from './fontpicker.js';
 import { templateGallery } from './gallery.js';
@@ -181,6 +181,8 @@ export class Editor {
     this.el = h('div', { class: 'editor' }, topbar,
       h('div', { class: 'ed-body' }, this.pagesPanel, this.stage, this.tray), this.audioBar);
 
+    guardPencilButtons(topbar);
+    guardPencilButtons(this.tray);
     const cv = this.liveCv;
     cv.addEventListener('pointerdown', (e) => this.onDown(e));
     cv.addEventListener('pointermove', (e) => this.onMove(e));
@@ -195,6 +197,9 @@ export class Editor {
     // iOS: stop scrolling, magnifier, text selection and double-tap zoom on the canvas
     cv.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
     cv.addEventListener('touchmove', (e) => this.onStylusTouchMove(e), { passive: false });
+    cv.addEventListener('touchend', (e) => {
+      if (e.changedTouches.length && Array.from(e.changedTouches).every((t) => t.touchType === 'stylus')) e.preventDefault();
+    }, { passive: false });
     cv.addEventListener('dblclick', (e) => e.preventDefault());
     this.stage.addEventListener('dragover', (e) => { e.preventDefault(); });
     // Android / iOS scroll the page to a focused text box when the keyboard opens;

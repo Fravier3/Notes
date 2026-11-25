@@ -4,6 +4,49 @@ import { icons } from './icons.js';
 
 let openPop = null;
 
+// iPadOS can treat a stylus tap followed by drawing as Scribble. Cancel the
+// stylus touch stream on drawing buttons and activate only an actual tap.
+export function guardPencilButtons(root) {
+  let pending = null;
+  const options = { passive: false };
+  root.addEventListener('touchstart', (event) => {
+    const button = event.target.closest?.('button:not(:disabled)');
+    const touch = event.changedTouches.length === 1 && event.changedTouches[0];
+    if (!button || !root.contains(button) || !touch || touch.touchType !== 'stylus' || !event.cancelable) return;
+    event.preventDefault();
+    pending = { button, id: touch.identifier, x: touch.clientX, y: touch.clientY, moved: false };
+  }, options);
+
+  const trackedTouch = (event) => {
+    if (!pending) return null;
+    for (const touch of event.changedTouches) {
+      if (touch.identifier === pending.id && touch.touchType === 'stylus') return touch;
+    }
+    return null;
+  };
+
+  root.addEventListener('touchmove', (event) => {
+    const touch = trackedTouch(event);
+    if (!touch) return;
+    event.preventDefault();
+    if (Math.hypot(touch.clientX - pending.x, touch.clientY - pending.y) > 10) pending.moved = true;
+  }, options);
+
+  root.addEventListener('touchend', (event) => {
+    const touch = trackedTouch(event);
+    if (!touch) return;
+    event.preventDefault();
+    const { button, x, y, moved } = pending;
+    pending = null;
+    if (!moved && !button.disabled && root.contains(button) &&
+        Math.hypot(touch.clientX - x, touch.clientY - y) <= 10) button.click();
+  }, options);
+
+  root.addEventListener('touchcancel', (event) => {
+    if (trackedTouch(event)) pending = null;
+  });
+}
+
 export function closePopover() {
   if (openPop) { openPop.remove(); openPop = null; }
 }
@@ -15,6 +58,7 @@ export function popover(anchor, content, { className = '' } = {}) {
   const scrim = h('div', { class: 'scrim' });
   const wrap = h('div', { class: 'pop-wrap' }, scrim, pop);
   scrim.addEventListener('pointerdown', (e) => { e.preventDefault(); closePopover(); });
+  if (anchor.closest?.('.editor')) guardPencilButtons(pop);
   document.body.append(wrap);
   openPop = wrap;
   const r = anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y, width: 0 };
