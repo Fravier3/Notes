@@ -58,7 +58,6 @@ export class Editor {
     this.pointers = new Map();
     this.dpr = Math.min(window.devicePixelRatio || 1, 3);
     this.penPaint = null;
-    this.pencilCursor.hidden = true;
     this.hidden = null;
     this.selection = null;
     this.lasers = [];
@@ -261,6 +260,8 @@ export class Editor {
     this.rect = r;
     this.vw = r.width; this.vh = r.height;
     this.dpr = Math.min(window.devicePixelRatio || 1, 3);
+    this.penPaint = null;
+    this.pencilCursor.hidden = true;
     for (const c of [this.main, this.liveCv]) {
       c.width = Math.round(this.vw * this.dpr);
       c.height = Math.round(this.vh * this.dpr);
