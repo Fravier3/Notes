@@ -3,7 +3,7 @@
 import { h, uid, clamp, debounce, toast, fmtTime, pickFile, saveFile, safeName, loadImage } from './util.js';
 import { icons } from './icons.js';
 import { settings, saveSettings, fingerDraws, applyTheme } from './settings.js';
-import { drawStroke, drawLiveStroke, LIVE_INK_DAMAGE_POINTS, strokeBBox, itemBBox, invalidate, strokeHit, strokeHitSegment, splitStroke, lassoHit, transformItem, round2, inkColor, openTapes } from './ink.js';
+import { drawStroke, drawLiveStroke, appendPenPreview, itemBBox, invalidate, strokeHit, strokeHitSegment, splitStroke, lassoHit, transformItem, round2, inkColor, openTapes } from './ink.js';
 import { toolboxMethods, STICKY_COLORS } from './toolbox.js';
 import { recognize } from './shapes.js';
 import { drawPage, drawItems, measureText, renderPageCanvas, fontFor, drawImageItem, visualBBox } from './render.js';
@@ -194,7 +194,7 @@ export class Editor {
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
     // iOS: stop scrolling, magnifier, text selection and double-tap zoom on the canvas
     cv.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
-    cv.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+    cv.addEventListener('touchmove', (e) => this.onStylusTouchMove(e), { passive: false });
     cv.addEventListener('dblclick', (e) => e.preventDefault());
     this.stage.addEventListener('dragover', (e) => { e.preventDefault(); });
     // Android / iOS scroll the page to a focused text box when the keyboard opens;
@@ -543,13 +543,13 @@ export class Editor {
   }
 
   canPaintPen(L) {
-    return !!(L?.pen && L.tool === 'pen' && !L.shape && !L.edge && L.style !== 'dash' && L.style !== 'dot' &&
+    return !!(L?.pen && L.tool === 'pen' && !L.shape && !L.edge && (L.style === 'fountain' || L.style === 'ball') &&
       !this.lasers.length && !this.lasso && !this.selection && !this.quiz &&
       !this.zoom && !this.ruler && !this.hover);
   }
 
   presentLiveInk() {
-    if (this.needMain || !this.canPaintPen(this.live)) { this.requestLive(); return; }
+    if (!this.canPaintPen(this.live)) { this.requestLive(); return; }
     this.needLive = false;
     this.paintLivePen(this.live);
   }
@@ -562,24 +562,17 @@ export class Editor {
       previous.y === y && previous.pageX === L.o.x && previous.pageY === L.o.y;
     if (sameView && previous.n === n) return;
 
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.save();
-    if (sameView) {
-      // Include the whole previous variable-width tail and the join into its
-      // cached curve. Older ink pixels stay in place.
-      const tail = pts.slice(Math.max(0, previous.n - LIVE_INK_DAMAGE_POINTS * 3));
-      const bounds = strokeBBox(tail, L.size * 2);
-      const left = Math.floor((x + (L.o.x + bounds.x) * s) * dpr) - 2;
-      const top = Math.floor((y + (L.o.y + bounds.y) * s) * dpr) - 2;
-      const right = Math.ceil(left + bounds.w * s * dpr) + 5;
-      const bottom = Math.ceil(top + bounds.h * s * dpr) + 5;
-      ctx.beginPath(); ctx.rect(left, top, right - left, bottom - top); ctx.clip();
-      ctx.clearRect(left, top, right - left, bottom - top);
-    } else {
+    if (!sameView) {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, this.liveCv.width, this.liveCv.height);
     }
     L.pred = null;
-    this.paintLiveStroke(L);
+    this.pageTransform(ctx, L.o);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, L.o.page.w, L.o.page.h);
+    ctx.clip();
+    appendPenPreview(ctx, L, sameView ? previous.n : 0, isDarkPaper(L.o.page.color) && !L.o.page.bg);
     ctx.restore();
     this.penPaint = { stroke: L, n, s, x, y, pageX: L.o.x, pageY: L.o.y };
   }
@@ -873,10 +866,38 @@ export class Editor {
       return;
     }
     if (p.role !== 'draw') return;
-    let evs = e.getCoalescedEvents ? e.getCoalescedEvents() : null;
-    if (!evs || !evs.length) evs = [e];
+    if (p.stylusTouchId != null && performance.now() - p.stylusTouchAt < 40) return;
+    const evs = e.getCoalescedEvents?.();
+    this.moveDrawingPointer(p, evs?.length ? evs : [e], e);
+  }
+
+  onStylusTouchMove(event) {
+    event.preventDefault();
+    const L = this.live;
+    if (!L?.pen) return;
+    const pointer = this.pointers.get(L.pid);
+    if (pointer?.role !== 'draw') return;
+    for (const touch of event.changedTouches) {
+      if (touch.touchType !== 'stylus' ||
+          (pointer.stylusTouchId != null && pointer.stylusTouchId !== touch.identifier)) continue;
+
+      // Some iPads report pen moves sooner through Touch Events. Pointer Events
+      // still own contact, hover and lift; avoid replaying their delayed motion.
+      pointer.stylusTouchId = touch.identifier;
+      pointer.stylusTouchAt = performance.now();
+      this.moveDrawingPointer(pointer, [{
+        clientX: touch.clientX, clientY: touch.clientY,
+        pointerType: 'pen', pressure: touch.force, timeStamp: event.timeStamp,
+      }], event);
+      return;
+    }
+  }
+
+  moveDrawingPointer(p, events, e) {
     if (p.type === 'pen') window.__inkInput = performance.now();
-    for (const ev of evs) {
+    for (const ev of events) {
+      if (p.type === 'pen' && ev.timeStamp < (p.lastInkEvent ?? -Infinity)) continue;
+      p.lastInkEvent = ev.timeStamp;
       const pos = this.localPos(ev);
       p.sx = pos.x; p.sy = pos.y;
       this.moveTool(p, ev);
@@ -1262,8 +1283,8 @@ export class Editor {
   pressure(ev, L) {
     if (ev.pointerType === 'pen') {
       if (!settings.pressure) return 0.5;
-      let pr = ev.pressure;
-      if (!pr) pr = L ? L.lastP : 0.35;
+      if (!ev.pressure && L) return L.lastP;
+      const pr = ev.pressure || 0.35;
       return clamp(Math.pow(pr, 0.75), 0.05, 1);
     }
     return 0.5; // mouse & finger: steady width

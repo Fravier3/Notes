@@ -258,9 +258,29 @@ function pencilPattern(color) {
   return p;
 }
 
+// Paint only newly received Pencil samples. The normal outline is still used
+// for the saved stroke; this opaque preview does no curve fitting or replay.
+export function appendPenPreview(ctx, stroke, from, dark) {
+  const { pts, size, style } = stroke;
+  const color = inkColor(stroke.color, dark);
+  ctx.fillStyle = ctx.strokeStyle = color;
+  ctx.lineCap = 'round';
+  if (!from) {
+    ctx.beginPath();
+    ctx.arc(pts[0], pts[1], Math.max(0.3, penRadius(size, pts[2], style)), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  for (let i = Math.max(3, from); i < pts.length; i += 3) {
+    ctx.lineWidth = Math.max(0.6, 2 * penRadius(size, (pts[i - 1] + pts[i + 2]) / 2, style));
+    ctx.beginPath();
+    ctx.moveTo(pts[i - 3], pts[i - 2]);
+    ctx.lineTo(pts[i], pts[i + 1]);
+    ctx.stroke();
+  }
+}
+
 // Live (uncached) version used while the pen is down.
 const CHUNK = 40; // points per finished piece of a stroke being written
-export const LIVE_INK_DAMAGE_POINTS = CHUNK + 6;
 
 function piecePath(it, pts, openStart, openEnd) {
   return it.tool === 'hl' || it.tool === 'laser' || it.tool === 'tape'
