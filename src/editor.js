@@ -3,7 +3,7 @@
 import { h, uid, clamp, debounce, toast, fmtTime, pickFile, saveFile, safeName, loadImage } from './util.js';
 import { icons } from './icons.js';
 import { settings, saveSettings, fingerDraws, applyTheme } from './settings.js';
-import { drawStroke, drawLiveStroke, itemBBox, invalidate, strokeHit, strokeHitSegment, splitStroke, lassoHit, transformItem, round2, inkColor, openTapes } from './ink.js';
+import { drawStroke, drawLiveStroke, LIVE_INK_DAMAGE_POINTS, strokeBBox, itemBBox, invalidate, strokeHit, strokeHitSegment, splitStroke, lassoHit, transformItem, round2, inkColor, openTapes } from './ink.js';
 import { toolboxMethods, STICKY_COLORS } from './toolbox.js';
 import { recognize } from './shapes.js';
 import { drawPage, drawItems, measureText, renderPageCanvas, fontFor, drawImageItem, visualBBox } from './render.js';
@@ -57,6 +57,8 @@ export class Editor {
     this.cam = { s: 1, x: 0, y: 0 };
     this.pointers = new Map();
     this.dpr = Math.min(window.devicePixelRatio || 1, 3);
+    this.penPaint = null;
+    this.pencilCursor.hidden = true;
     this.hidden = null;
     this.selection = null;
     this.lasers = [];
@@ -171,7 +173,8 @@ export class Editor {
     this.pageInd = h('div', { class: 'page-ind' });
     this.addTile = h('button', { class: 'add-tile', hidden: true, onClick: () => this.addPage(this.pages.length - 1) }, h('span', { html: icons.plus }), 'Add page');
     this.focusExit = h('button', { class: 'focus-exit', title: 'Exit full screen', 'aria-label': 'Exit full screen', html: icons.shrink, onClick: () => this.toggleFocus() });
-    this.stage = h('div', { class: 'stage' }, this.main, this.liveCv, this.textarea, this.textGrip, this.textWidthGrip, this.textBar, this.selMenu, this.pageInd, this.addTile, this.focusExit);
+    this.pencilCursor = h('div', { class: 'pencil-hover', hidden: true, 'aria-hidden': 'true' });
+    this.stage = h('div', { class: 'stage' }, this.main, this.liveCv, this.pencilCursor, this.textarea, this.textGrip, this.textWidthGrip, this.textBar, this.selMenu, this.pageInd, this.addTile, this.focusExit);
 
     this.audioBar = h('div', { class: 'audio-bar', hidden: true });
     this.pagesPanel = h('aside', { class: 'pages-panel', hidden: true });
@@ -184,7 +187,10 @@ export class Editor {
     cv.addEventListener('pointermove', (e) => this.onMove(e));
     cv.addEventListener('pointerup', (e) => this.onUp(e));
     cv.addEventListener('pointercancel', (e) => this.onUp(e, true));
-    cv.addEventListener('pointerleave', (e) => { if (!this.pointers.has(e.pointerId) && this.hover) { this.hover = null; this.requestLive(); } });
+    cv.addEventListener('pointerleave', (e) => {
+      if (e.pointerType === 'pen') this.pencilCursor.hidden = true;
+      if (!this.pointers.has(e.pointerId) && this.hover) { this.hover = null; this.requestLive(); }
+    });
     cv.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
     // iOS: stop scrolling, magnifier, text selection and double-tap zoom on the canvas
@@ -535,30 +541,77 @@ export class Editor {
     ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * (x + o.x * s), dpr * (y + o.y * s));
   }
 
+  canPaintPen(L) {
+    return !!(L?.pen && L.tool === 'pen' && !L.shape && !L.edge && L.style !== 'dash' && L.style !== 'dot' &&
+      !this.lasers.length && !this.lasso && !this.selection && !this.quiz &&
+      !this.zoom && !this.ruler && !this.hover);
+  }
+
+  presentLiveInk() {
+    if (this.needMain || !this.canPaintPen(this.live)) { this.requestLive(); return; }
+    this.needLive = false;
+    this.paintLivePen(this.live);
+  }
+
+  paintLivePen(L) {
+    const ctx = this.lctx, pts = L.pts, n = pts.length;
+    const { s, x, y } = this.cam, dpr = this.dpr;
+    const previous = this.penPaint;
+    const sameView = previous?.stroke === L && previous.s === s && previous.x === x &&
+      previous.y === y && previous.pageX === L.o.x && previous.pageY === L.o.y;
+    if (sameView && previous.n === n) return;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.save();
+    if (sameView) {
+      // Include the whole previous variable-width tail and the join into its
+      // cached curve. Older ink pixels stay in place.
+      const tail = pts.slice(Math.max(0, previous.n - LIVE_INK_DAMAGE_POINTS * 3));
+      const bounds = strokeBBox(tail, L.size * 2);
+      const left = Math.floor((x + (L.o.x + bounds.x) * s) * dpr) - 2;
+      const top = Math.floor((y + (L.o.y + bounds.y) * s) * dpr) - 2;
+      const right = Math.ceil(left + bounds.w * s * dpr) + 5;
+      const bottom = Math.ceil(top + bounds.h * s * dpr) + 5;
+      ctx.beginPath(); ctx.rect(left, top, right - left, bottom - top); ctx.clip();
+      ctx.clearRect(left, top, right - left, bottom - top);
+    } else {
+      ctx.clearRect(0, 0, this.liveCv.width, this.liveCv.height);
+    }
+    L.pred = null;
+    this.paintLiveStroke(L);
+    ctx.restore();
+    this.penPaint = { stroke: L, n, s, x, y, pageX: L.o.x, pageY: L.o.y };
+  }
+
+  paintLiveStroke(L) {
+    const ctx = this.lctx;
+    this.pageTransform(ctx, L.o);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.o.page.w, L.o.page.h); ctx.clip();
+    ctx.__dark = isDarkPaper(L.o.page.color) && !L.o.page.bg;
+    const D = L.draw && L.draw.pts === L.pts ? L.draw : (L.draw = { type: 'stroke', tool: L.tool, style: L.style, color: L.color, size: L.size, pts: L.pts });
+    D.shape = L.shape; D.closed = L.closed;
+    let extra = null;
+    if (!L.shape && !L.straight) {
+      if (!L.pen) extra = [L.raw.x, L.raw.y, L.lastP];
+      if (L.pred && performance.now() < L.pred.until) {
+        extra = [L.pred.x, L.pred.y, L.lastP];
+        this.requestLive();
+      }
+    }
+    drawLiveStroke(ctx, D, extra);
+    ctx.__dark = false;
+    ctx.restore();
+  }
+
   drawLive() {
+    const L = this.live;
+    if (this.canPaintPen(L)) { this.paintLivePen(L); return; }
+    this.penPaint = null;
     const ctx = this.lctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, this.liveCv.width, this.liveCv.height);
-    const L = this.live;
-    if (L) {
-      this.pageTransform(ctx, L.o);
-      ctx.save();
-      ctx.beginPath(); ctx.rect(0, 0, L.o.page.w, L.o.page.h); ctx.clip();
-      ctx.__dark = isDarkPaper(L.o.page.color) && !L.o.page.bg;
-      const D = L.draw && L.draw.pts === L.pts ? L.draw : (L.draw = { type: 'stroke', tool: L.tool, style: L.style, color: L.color, size: L.size, pts: L.pts });
-      D.shape = L.shape; D.closed = L.closed;
-      let extra = null;
-      if (!L.shape && !L.straight) {
-        if (!L.pen) extra = [L.raw.x, L.raw.y, L.lastP];
-        if (L.pred && performance.now() < L.pred.until) {
-          extra = [L.pred.x, L.pred.y, L.lastP];
-          this.requestLive();
-        }
-      }
-      drawLiveStroke(ctx, D, extra);
-      ctx.__dark = false;
-      ctx.restore();
-    }
+    if (L) this.paintLiveStroke(L);
     if (this.lasers.length) {
       const now = performance.now();
       this.lasers = this.lasers.filter((l) => !l.end || now - l.end < 900);
@@ -719,6 +772,7 @@ export class Editor {
 
   onDown(e) {
     e.preventDefault();
+    this.pencilCursor.hidden = true;
     window.__inkInput = performance.now();
     closePopover();
     this.rect = this.liveCv.getBoundingClientRect();
@@ -786,6 +840,9 @@ export class Editor {
   onMove(e) {
     const p = this.pointers.get(e.pointerId);
     if (!p) {
+      if (e.pointerType === 'pen' && !e.buttons && !e.pressure && !this.pointers.size) {
+        this.showPencilCursor(e);
+      }
       if ((e.pointerType === 'pen' || e.pointerType === 'mouse') && this.tool === 'eraser') {
         this.hover = this.localPos(e);
         this.requestLive();
@@ -824,9 +881,20 @@ export class Editor {
       this.moveTool(p, ev);
     }
     const L = this.live;
-    if (L && L.pid === p.id) this.predictInkTip(L, p, e);
+    if (L && L.pid === p.id) {
+      if (this.canPaintPen(L)) L.pred = null;
+      else this.predictInkTip(L, p, e);
+    }
     if (this.tool === 'eraser' || this.eraserOverride) this.hover = { x: p.sx, y: p.sy };
-    this.requestLive();
+    this.presentLiveInk();
+  }
+
+  showPencilCursor(event) {
+    const pos = this.localPos(event);
+    const doc = this.screenToDoc(pos.x, pos.y);
+    const visible = !this.meta.locked && DRAW_TOOLS.includes(this.tool) && !!this.pageAt(doc.x, doc.y);
+    this.pencilCursor.hidden = !visible;
+    if (visible) this.pencilCursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)`;
   }
 
   predictInkTip(stroke, pointer, event) {
@@ -1095,7 +1163,7 @@ export class Editor {
       };
       if (t === 'laser') { L.end = 0; this.lasers.push(L); this.laser = L; }
       else { this.live = L; this.armHold(); }
-      this.requestLive();
+      this.presentLiveInk();
     } else if (t === 'eraser') {
       const o = this.pageAt(d.x, d.y, 30);
       if (!o) { p.role = 'none'; return; }
@@ -2670,6 +2738,7 @@ export class Editor {
   smallScreen() { return (this.vw || innerWidth) < 700; }
 
   setTool(t, keepSelection = false) {
+    this.pencilCursor.hidden = true;
     if (this.textEdit && t !== 'text') this.commitText();
     if (!keepSelection && this.selection) this.clearSelection();
     if (t === 'eraser' && this.tool !== 'eraser') this.prevTool = this.tool;

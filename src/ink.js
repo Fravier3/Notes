@@ -260,6 +260,7 @@ function pencilPattern(color) {
 
 // Live (uncached) version used while the pen is down.
 const CHUNK = 40; // points per finished piece of a stroke being written
+export const LIVE_INK_DAMAGE_POINTS = CHUNK + 6;
 
 function piecePath(it, pts, openStart, openEnd) {
   return it.tool === 'hl' || it.tool === 'laser' || it.tool === 'tape'

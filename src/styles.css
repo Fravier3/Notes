@@ -333,6 +333,8 @@ button.act-card:hover { border-color: var(--accent); }
 .stage { flex: 1; position: relative; overflow: hidden; min-width: 0; background: var(--stage); touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .stage canvas { position: absolute; left: 0; top: 0; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .cv-live { z-index: 2; }
+.pencil-hover { position: absolute; inset: 0 auto auto 0; z-index: 3; pointer-events: none; }
+.pencil-hover::after { content: ''; position: absolute; width: 6px; height: 6px; border-radius: 50%; background: #282c36; box-shadow: 0 0 0 1px #fff; transform: translate(-50%, -50%); }
 .cv-fade { z-index: 1; pointer-events: none; opacity: 1; transition: opacity .3s ease; }
 .text-grip { position: absolute; left: 0; top: 0; z-index: 4; width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--accent); color: #fff; box-shadow: var(--shadow); cursor: grab; touch-action: none; }
 .text-grip svg { width: 18px; height: 18px; }
